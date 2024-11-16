@@ -55,3 +55,10 @@ func (r *ReliableRedisStreamClient) lockAndExtend(mutex *redsync.Mutex) error {
 
 	return nil
 }
+
+func (r *ReliableRedisStreamClient) safeCloseLBS() {
+	if !r.lbsChanClosed {
+		close(r.lbsChan)
+		r.lbsChanClosed = true
+	}
+}
