@@ -1,6 +1,7 @@
 package impl
 
 import (
+	"bburli/redis-stream-client-go/notifs"
 	"bburli/redis-stream-client-go/types"
 	"context"
 	"errors"
@@ -14,20 +15,14 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// ReliableRedisStreamClient is an implementation of the RedisStreamClient interface
-type ReliableRedisStreamClient struct {
+// RecoverableRedisStreamClient is an implementation of the RedisStreamClient interface
+type RecoverableRedisStreamClient struct {
 	// underlying redis client used to interact with redis
 	redisClient redis.UniversalClient
 	// consumerID is the unique identifier for the consumer
 	consumerID string
-	// streamDisownedChan is the channel to read if a key owned by a consumer has to be disowned and stopped from consuming
-	streamDisownedChan chan string
 	// kspChan is the channel to read keyspace notifications
 	kspChan <-chan *redis.Message
-	// lbsChan is the channel to read messages from the LBS stream
-	lbsChan chan *redis.XMessage
-	// lbsChanClosed tracks if lbsChan is closed or not
-	lbsChanClosed atomic.Bool
 	// lbsCtxCancelFunc is used to control when to kill go routines spwaned as part of lbs
 	lbsCtxCancelFunc context.CancelFunc
 	// hbInterval is the interval at which the client sends heartbeats
@@ -38,6 +33,10 @@ type ReliableRedisStreamClient struct {
 	serviceName string
 	// redis pub sub subscription
 	pubSub *redis.PubSub
+	// outputChan is the channel exposed to clients on which we relay all messages
+	outputChan chan notifs.RecoverableRedisNotification[any]
+	// outputChanClosed tracks if the outputChan is still being read by client
+	outputChanClosed atomic.Bool
 }
 
 // NewRedisStreamClient creates a new RedisStreamClient
@@ -67,21 +66,20 @@ func NewRedisStreamClient(redisClient redis.UniversalClient, serviceName string)
 	// extension failed two consecutive times
 	defaultHBInterval := 2 * time.Second
 
-	return &ReliableRedisStreamClient{
-		redisClient:        redisClient,
-		consumerID:         consumerID,
-		streamDisownedChan: make(chan string, 500),
-		lbsChanClosed:      atomic.Bool{},
-		kspChan:            make(<-chan *redis.Message, 500),
-		lbsChan:            make(chan *redis.XMessage, 500),
-		hbInterval:         defaultHBInterval,
-		streamLocks:        make(map[string]*lbsInfo),
-		serviceName:        serviceName,
+	return &RecoverableRedisStreamClient{
+		redisClient:      redisClient,
+		consumerID:       consumerID,
+		kspChan:          make(<-chan *redis.Message, 500),
+		hbInterval:       defaultHBInterval,
+		streamLocks:      make(map[string]*lbsInfo),
+		serviceName:      serviceName,
+		outputChan:       make(chan notifs.RecoverableRedisNotification[any], 500),
+		outputChanClosed: atomic.Bool{},
 	}
 }
 
 // ID returns the consumer name that uniquely identifies the consumer
-func (r *ReliableRedisStreamClient) ID() string {
+func (r *RecoverableRedisStreamClient) ID() string {
 	return r.consumerID
 }
 
@@ -91,10 +89,10 @@ func (r *ReliableRedisStreamClient) ID() string {
 // subscribing to expired events, and starting a blocking read on the LBS stream
 // Returns a channel to read messages from the LBS stream. The client should read from this channel and process the messages.
 // Returns a channel to read keyspace notifications. The client should read from this channel and process the notifications.
-func (r *ReliableRedisStreamClient) Init(ctx context.Context) (<-chan *redis.XMessage, <-chan *redis.Message, <-chan string, error) {
+func (r *RecoverableRedisStreamClient) Init(ctx context.Context) (<-chan notifs.RecoverableRedisNotification[any], error) {
 	if r.checkErr(ctx, r.enableKeyspaceNotifsForExpiredEvents).
 		checkErr(ctx, r.subscribeToExpiredEvents) == nil {
-		return nil, nil, nil, fmt.Errorf("error initializing the client")
+		return nil, fmt.Errorf("error initializing the client")
 	}
 
 	lbsCtx, cancelFunc := context.WithCancel(ctx)
@@ -103,11 +101,14 @@ func (r *ReliableRedisStreamClient) Init(ctx context.Context) (<-chan *redis.XMe
 	// start blocking read on LBS stream
 	go r.readLBSStream(lbsCtx)
 
-	return r.lbsChan, r.kspChan, r.streamDisownedChan, nil
+	// listen to ksp chan
+	go r.listenKsp()
+
+	return r.outputChan, nil
 }
 
 // Claim claims pending messages from a stream
-func (r *ReliableRedisStreamClient) Claim(ctx context.Context, mutexKey string) error {
+func (r *RecoverableRedisStreamClient) Claim(ctx context.Context, mutexKey string) error {
 	lbsInfo, err := createByMutexKey(mutexKey)
 	if err != nil {
 		return err
@@ -147,6 +148,11 @@ func (r *ReliableRedisStreamClient) Claim(ctx context.Context, mutexKey string) 
 			return r.consumerID, nil
 		}))
 
+	// lock once
+	if err := mutex.Lock(); err != nil {
+		return err
+	}
+
 	go r.startExtendingKey(ctx, mutex, lbsInfo.DataStreamName)
 
 	// seed the mutex
@@ -157,7 +163,7 @@ func (r *ReliableRedisStreamClient) Claim(ctx context.Context, mutexKey string) 
 }
 
 // DoneDataStream marks end of processing for a particular stream
-func (r *ReliableRedisStreamClient) DoneDataStream(ctx context.Context, dataStreamName string) error {
+func (r *RecoverableRedisStreamClient) doneDataStream(ctx context.Context, dataStreamName string) error {
 	lbsInfo, ok := r.streamLocks[dataStreamName]
 	if !ok {
 		return fmt.Errorf("stream not found")
@@ -184,29 +190,40 @@ func (r *ReliableRedisStreamClient) DoneDataStream(ctx context.Context, dataStre
 }
 
 // Done marks the end of processing for a client
-func (r *ReliableRedisStreamClient) Done() error {
+func (r *RecoverableRedisStreamClient) Done() error {
 	ctx := context.Background()
 
 	for streamName := range r.streamLocks {
-		if err := r.DoneDataStream(ctx, streamName); err != nil {
+		if err := r.doneDataStream(ctx, streamName); err != nil {
 			return err
 		}
 	}
 
 	// release resources
-	return r.cleanup()
+	if err := r.cleanup(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (r *ReliableRedisStreamClient) cleanup() error {
-	r.safeCloseLBS()
-
+func (r *RecoverableRedisStreamClient) cleanup() error {
 	if err := r.pubSub.Close(); err != nil {
 		return err
 	}
 
-	// drain kspchan
+	// drain kspchan and ignore expired notifications
+	// since client has called Done and thus are no longer interested in expired notifications
 	for len(r.kspChan) > 0 {
 		<-r.kspChan
+	}
+
+	// cancel LBS context
+	r.lbsCtxCancelFunc()
+
+	// close the ouptut channe
+	if r.outputChanClosed.CompareAndSwap(false, true) {
+		close(r.outputChan)
 	}
 
 	return nil

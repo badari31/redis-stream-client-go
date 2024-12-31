@@ -49,10 +49,15 @@ client := rsc.NewRedisStreamClient(<go redis client>, <heartbeat_interval>, <ser
 Initialize the client and use the LBC and Key space notification channel for tracking which data streams to read and which have expired respectively:
 
 ```
-lbsChan, kspChan, err := client.Init(ctx)
+outputChan, err := client.Init(ctx)
 ```
 
-When a notification is received on `kspChan`, then client calls `Claim` to claim the datastream name:
+There are currently three types of notifications sent on `outputChan`:
+1. `StreamAdded` - When a new stream gets added to LBS. You should take the stream and start reading your data from it using standard `XREAD` or `XREADGROUP` commands as applicable.
+2. `StreamExpired` - When a client's ownership of stream expires and it relinquishes the lock. This is sent when key space notification arrives on stream expiry. Other clients should process this and take ownership of the stream by using `Claim` API.
+3. `StreamDisowned` - When a client gets stuck (not crashed) and thus automatically relinquishes ownership, another active client will claim it. When the old client comes back, it will fail to extend the lock and thus will be informed that it now doesn't own the stream. The old client should gracefully exit by calling `Done` API.
+
+# claiming
 
 ```
 err := client.Claim(ctx, <ksp notification payload>)
@@ -60,13 +65,7 @@ err := client.Claim(ctx, <ksp notification payload>)
 
 An error in `Claim` indicates the client was not successful in claiming the stream as some other client got there before.
 
-After all the processing is done, call `DoneDataStream` on client to mark end for a particular data stream that the consumer owns.
-
-```
-client.DoneDataStream(ctx, <data stream name>)
-```
-
-Or if the client wants to release all streams and mark them as done (for whatever reason): use `Done(ctx)`
+After all the processing is done, call `Done` on client to mark end for a particular data stream that the consumer owns.
 
 ```
 client.Done(ctx)

@@ -3,19 +3,17 @@ package impl
 import (
 	"bburli/redis-stream-client-go/types"
 	"context"
-
-	"github.com/go-redsync/redsync/v4"
 )
 
-func (r *ReliableRedisStreamClient) lbsGroupName() string {
+func (r *RecoverableRedisStreamClient) lbsGroupName() string {
 	return r.serviceName + types.GroupSuffix
 }
 
-func (r *ReliableRedisStreamClient) lbsName() string {
+func (r *RecoverableRedisStreamClient) lbsName() string {
 	return r.serviceName + types.InputSuffix
 }
 
-func (r *ReliableRedisStreamClient) checkErr(ctx context.Context, fn func(context.Context) error) *ReliableRedisStreamClient {
+func (r *RecoverableRedisStreamClient) checkErr(ctx context.Context, fn func(context.Context) error) *RecoverableRedisStreamClient {
 	if r == nil {
 		return nil
 	}
@@ -27,29 +25,11 @@ func (r *ReliableRedisStreamClient) checkErr(ctx context.Context, fn func(contex
 	return r
 }
 
-func (r *ReliableRedisStreamClient) isContextDone(ctx context.Context) bool {
+func (r *RecoverableRedisStreamClient) isContextDone(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
 		return true
 	default:
 		return false
-	}
-}
-
-func (r *ReliableRedisStreamClient) lockAndExtend(mutex *redsync.Mutex) error {
-	if err := mutex.Lock(); err != nil {
-		return err
-	}
-
-	if _, err := mutex.Extend(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (r *ReliableRedisStreamClient) safeCloseLBS() {
-	if r.lbsChanClosed.CompareAndSwap(false, true) {
-		close(r.lbsChan)
 	}
 }
